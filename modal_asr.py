@@ -1,7 +1,7 @@
 """
 VibeVoice-ASR Modal Deployment
 
-Modal 함수로 H100 GPU를 사용해 VibeVoice-ASR 추론을 실행합니다.
+Modal 함수로 B200 GPU를 사용해 VibeVoice-ASR 추론을 실행합니다.
 
 Usage:
     # 단일 파일 추론
@@ -9,6 +9,25 @@ Usage:
 """
 
 import modal
+
+# =============================================================================
+# Generation 설정 파라미터
+# =============================================================================
+
+# GPU 설정
+GPU_TYPE = "H200"  # H100, L40S 등 선택 가능 (B200은 현재 컨테이너에서 미지원)
+
+# 생성 파라미터
+MAX_NEW_TOKENS = 32768       # 생성할 최대 토큰 수 (긴 오디오용)
+
+# Beam Search 설정 (num_beams > 1이면 beam search 사용)
+NUM_BEAMS = 4                # 빔 개수 (높을수록 정확도가 향상되나 속도가 느려짐. 성능 중시는 5~10 권장)
+
+# Sampling 설정 (num_beams == 1 이고 temperature > 0 일 때 사용)
+TEMPERATURE = 0.0            # 샘플링 온도 (Beam Search 사용 시 무시됨)
+TOP_P = 1.0                  # nucleus sampling 확률 임계값 (Beam Search 사용 시 무시됨)
+
+# =============================================================================
 
 # Modal App 정의
 app = modal.App("vibevoice-asr")
@@ -42,7 +61,7 @@ image = (
     .run_commands(
         # flash-attn GPU 환경에서 빌드 (--no-build-isolation 필수)
         "pip install flash-attn --no-build-isolation",
-        gpu="H100",
+        gpu=GPU_TYPE,
     )
     .run_commands(
         # VibeVoice 설치
@@ -57,8 +76,8 @@ MODEL_DIR = "/models"
 
 @app.cls(
     image=image,
-    gpu="H100",
-    timeout=1800,
+    gpu=GPU_TYPE,
+    timeout=00,
     volumes={MODEL_DIR: model_volume},
 )
 class VibeVoiceASR:
@@ -95,7 +114,7 @@ class VibeVoiceASR:
             language_model_pretrained_name="Qwen/Qwen2.5-7B"
         )
 
-        # 모델 로드 (H100에서 flash_attention_2 사용)
+        # 모델 로드 (flash_attention_2 사용)
         self.model = VibeVoiceASRForConditionalGeneration.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
@@ -112,8 +131,6 @@ class VibeVoiceASR:
         self,
         audio_bytes: bytes,
         filename: str = "audio.wav",
-        max_new_tokens: int = 32768,
-        temperature: float = 0.0,
     ) -> dict:
         """
         오디오 파일을 텍스트로 변환합니다.
@@ -121,8 +138,6 @@ class VibeVoiceASR:
         Args:
             audio_bytes: 오디오 파일의 바이트 데이터
             filename: 파일 이름 (확장자로 형식 판단)
-            max_new_tokens: 생성할 최대 토큰 수
-            temperature: 샘플링 온도 (0 = greedy decoding)
 
         Returns:
             dict: {
@@ -159,16 +174,27 @@ class VibeVoiceASR:
 
             print(f"Input shape: {inputs['input_ids'].shape}")
 
-            # Generation config
+            # Generation config (reference 구현과 동일한 로직)
             gen_config = {
-                "max_new_tokens": max_new_tokens,
+                "max_new_tokens": MAX_NEW_TOKENS,
                 "pad_token_id": self.processor.pad_id,
                 "eos_token_id": self.processor.tokenizer.eos_token_id,
-                "do_sample": temperature > 0,
             }
-            if temperature > 0:
-                gen_config["temperature"] = temperature
-                gen_config["top_p"] = 1.0
+
+            # Beam search vs sampling (reference 로직과 동일)
+            if NUM_BEAMS > 1:
+                gen_config["num_beams"] = NUM_BEAMS
+                gen_config["do_sample"] = False
+                print(f"Beam Search: num_beams={NUM_BEAMS}")
+            else:
+                do_sample = TEMPERATURE > 0
+                gen_config["do_sample"] = do_sample
+                if do_sample:
+                    gen_config["temperature"] = TEMPERATURE
+                    gen_config["top_p"] = TOP_P
+                    print(f"Sampling: temp={TEMPERATURE}, top_p={TOP_P}")
+                else:
+                    print("Greedy Decoding")
 
             # 추론
             start_time = time.time()
@@ -202,6 +228,8 @@ class VibeVoiceASR:
                 "raw_text": raw_text,
                 "segments": segments,
                 "generation_time": generation_time,
+                "num_beams": NUM_BEAMS,
+                "gpu_type": GPU_TYPE,
             }
 
         finally:
